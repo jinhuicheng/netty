@@ -20,13 +20,16 @@ import io.netty.buffer.Unpooled;
 import io.netty.channel.ChannelHandlerContext;
 import io.netty.channel.ChannelInboundHandlerAdapter;
 import io.netty.channel.embedded.EmbeddedChannel;
+import io.netty.util.CharsetUtil;
 import io.netty.util.ReferenceCountUtil;
 import org.junit.Assert;
 import org.junit.Test;
 
+import java.nio.charset.Charset;
 import java.util.List;
 import java.util.concurrent.BlockingQueue;
 import java.util.concurrent.LinkedBlockingDeque;
+import java.util.concurrent.atomic.AtomicBoolean;
 
 public class ByteToMessageDecoderTest {
 
@@ -159,5 +162,62 @@ public class ByteToMessageDecoderTest {
         Assert.assertEquals(2, (int) queue.take());
         Assert.assertEquals(3, (int) queue.take());
         Assert.assertTrue(queue.isEmpty());
+    }
+
+    // See https://github.com/netty/netty/pull/3263
+    @Test
+    public void testFireChannelReadCompleteOnlyWhenDecoded() {
+        final AtomicBoolean readComplete = new AtomicBoolean(false);
+        EmbeddedChannel ch = new EmbeddedChannel(new ByteToMessageDecoder() {
+            @Override
+            protected void decode(ChannelHandlerContext ctx, ByteBuf in, List<Object> out) throws Exception {
+                // Do nothing
+            }
+        }, new ChannelInboundHandlerAdapter() {
+            @Override
+            public void channelReadComplete(ChannelHandlerContext ctx) throws Exception {
+                readComplete.set(true);
+            }
+        });
+        Assert.assertFalse(ch.writeInbound(Unpooled.copiedBuffer("test", CharsetUtil.US_ASCII)));
+        Assert.assertFalse(ch.finish());
+        Assert.assertFalse(readComplete.get());
+    }
+
+    // See https://github.com/netty/netty/pull/3263
+    @Test
+    public void testFireChannelReadCompleteWhenDecodeOnce() {
+        final AtomicBoolean readComplete = new AtomicBoolean(false);
+        EmbeddedChannel ch = new EmbeddedChannel(new ChannelInboundHandlerAdapter() {
+            @Override
+            public void channelRead(ChannelHandlerContext ctx, Object msg) throws Exception {
+                ctx.fireChannelRead(msg);
+                ctx.fireChannelRead(Unpooled.EMPTY_BUFFER);
+            }
+        }, new ByteToMessageDecoder() {
+            private boolean first = true;
+            @Override
+            protected void decode(ChannelHandlerContext ctx, ByteBuf in, List<Object> out) throws Exception {
+                if (first) {
+                    first = false;
+                    out.add(in.readSlice(in.readableBytes()).retain());
+                }
+            }
+        }, new ChannelInboundHandlerAdapter() {
+            @Override
+            public void channelReadComplete(ChannelHandlerContext ctx) throws Exception {
+                readComplete.set(true);
+            }
+        });
+        Assert.assertTrue(ch.writeInbound(Unpooled.copiedBuffer("test", CharsetUtil.US_ASCII)));
+        Assert.assertTrue(ch.finish());
+        Assert.assertTrue(readComplete.get());
+        for (;;) {
+            ByteBuf buf = (ByteBuf) ch.readInbound();
+            if (buf == null) {
+                break;
+            }
+            buf.release();
+        }
     }
 }
